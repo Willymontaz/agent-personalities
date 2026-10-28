@@ -1,0 +1,35 @@
+{
+  "backend": "ollama",
+  "model": "bge-m3",
+  "dims": 1024,
+  "host": "http://127.0.0.1:11434",
+  "keep_alive": "30m",
+  "timeout": 120,
+  "batch_size": 16,
+  "recipe": "v1",
+  "query_prefix": "",
+  "passage_prefix": "",
+  "tags_path": "memory/tags.yaml",
+
+  "retrieval": {
+    "k": 3,
+    "threshold": 0.50,
+    "tag_boost_per_match": 0.05,
+    "tag_boost_cap": 0.10,
+    "recency_base": 0.85,
+    "recency_span": 0.15,
+    "recency_scale_days": 180,
+    "importance_weight": 0.02
+  },
+
+  "compaction": {
+    "duplicate_threshold": 0.88,
+    "near_duplicate_threshold": 0.90,
+    "stale_max_importance": 2,
+    "stale_age_days": 180,
+    "stale_last_recalled_days": 120,
+    "oversized_chars": 1200,
+    "reviewed_grace_days": 90,
+    "nudge_threshold": 10
+  }
+}

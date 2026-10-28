@@ -1,0 +1,516 @@
+#!/opt/local/bin/python3
+"""bin/memory - the one CLI the personas and you use to touch memory.
+
+    install | doctor | add | search | list | show | supersede
+    archive | compact | reindex | tags
+
+Everything fails loudly: a broken daemon, a dims mismatch or a stale index is
+reported, never worked around.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from memlib import compact as compaction  # noqa: E402
+from memlib import config as configlib  # noqa: E402
+from memlib import embedder, retrieve, store  # noqa: E402
+
+OK, BAD = "ok  ", "FAIL"
+
+
+def _cfg(args) -> configlib.Config:
+    return configlib.load(args.root)
+
+
+def _guard_scope(cfg: configlib.Config, scope: str, args) -> int:
+    """Refuse to touch another persona's scope.
+
+    `bin/persona` exports PERSONA_NAME; when it is set, a session may only write
+    `shared` or its own scope, unless `--force` is passed. Outside a persona
+    launch (plain `claude`, the tests) the env var is unset and nothing is
+    guarded.
+    """
+    if getattr(args, "force", False):
+        return 0
+    persona = os.environ.get("PERSONA_NAME", "").strip()
+    if not persona:
+        return 0
+    if scope in ("shared", persona):
+        return 0
+    print(
+        f"refusing to write scope {scope!r} as persona {persona!r} "
+        f"(pass --force to override)",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _parse_tags(values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for chunk in values or []:
+        for tag in chunk.split(","):
+            tag = tag.strip()
+            if tag and tag not in out:
+                out.append(tag)
+    return out
+
+
+def load_vocabulary(cfg: configlib.Config) -> dict[str, list[str]]:
+    """memory/tags.yaml: one namespace per top-level key, leaves as `- item`."""
+    path = cfg.tags_path
+    if not path.is_file():
+        return {}
+    vocab: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t", "-")) and line.rstrip().endswith(":"):
+            current = line.split(":")[0].strip()
+            vocab[current] = []
+        elif current and line.lstrip().startswith("- "):
+            vocab[current].append(line.lstrip()[2:].strip())
+    return vocab
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_install(args) -> int:
+    cfg = _cfg(args)
+    print(f"pulling {cfg.model} via ollama ...")
+    proc = subprocess.run(["ollama", "pull", cfg.model])
+    if proc.returncode != 0:
+        print("ollama pull failed. Is ollama installed (`brew install ollama`)?", file=sys.stderr)
+        return proc.returncode
+    return cmd_doctor(args)
+
+
+def cmd_doctor(args) -> int:
+    cfg = _cfg(args)
+    failures = 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        print(f"[{OK if ok else BAD}] {label}{(' - ' + detail) if detail else ''}")
+
+    check("interpreter", sys.executable.startswith("/opt/local/"), sys.executable)
+    try:
+        import numpy
+
+        check("numpy", True, numpy.__version__)
+    except ImportError as exc:
+        check("numpy", False, str(exc))
+
+    try:
+        version = embedder.daemon_version(cfg)
+        check("ollama daemon", True, f"{cfg.host} v{version}")
+    except embedder.EmbeddingError as exc:
+        check("ollama daemon", False, str(exc))
+        print("\n  -> `ollama serve` (or `brew services start ollama`)", file=sys.stderr)
+        return 1
+
+    try:
+        present = embedder.model_installed(cfg)
+        check(f"model {cfg.model}", present, "installed" if present else "run `bin/memory install`")
+    except embedder.EmbeddingError as exc:
+        check(f"model {cfg.model}", False, str(exc))
+        return 1
+
+    try:
+        vec = embedder.embed_query(cfg, "doctor probe")
+        check("embedding dims", len(vec) == cfg.dims, f"{len(vec)} (config: {cfg.dims})")
+    except embedder.EmbeddingError as exc:
+        check("embedding dims", False, str(exc))
+
+    stale = store.index_is_stale(cfg)
+    check("index freshness", not stale, "stale - run `bin/memory reindex`" if stale else "current")
+
+    conn = store.connect(cfg)
+    try:
+        errors = store.index_errors(cfg, conn)
+        check("memory files", not errors, f"{len(errors)} could not be indexed" if errors else "all parse")
+        for err in errors:
+            print(f"       - {err}", file=sys.stderr)
+        counts = {
+            r["scope"]: r["n"]
+            for r in conn.execute("SELECT scope, COUNT(*) n FROM memories GROUP BY scope")
+        }
+    finally:
+        conn.close()
+    print(f"[{OK}] memories - " + (", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "none yet"))
+
+    return 1 if failures else 0
+
+
+def cmd_reindex(args) -> int:
+    cfg = _cfg(args)
+    stats = store.reindex(cfg, force=args.force)
+    print(f"indexed {stats['total']} memories ({stats['embedded']} embedded, {stats['reused']} reused)")
+    for err in stats.get("errors", []):
+        print(f"  skipped: {err}", file=sys.stderr)
+    return 0
+
+
+def _read_body(body_file: str | None, body: str | None) -> str:
+    if body_file == "-":
+        return sys.stdin.read()
+    if body_file:
+        return Path(body_file).read_text(encoding="utf-8")
+    return body or ""
+
+
+def cmd_add(args) -> int:
+    cfg = _cfg(args)
+    if _guard_scope(cfg, args.scope, args) != 0:
+        return 2
+    raw = _read_body(args.body_file, args.body)
+    body = raw.strip()
+    title = (args.title or "").strip()
+    if not body or not title:
+        print("refusing to store a memory with an empty title or body", file=sys.stderr)
+        return 2
+    if args.scope != "shared" and not cfg.scope_dir(args.scope).exists():
+        known = ", ".join(cfg.scopes())
+        if args.scope not in cfg.scopes() and not (cfg.agents_dir / f"{args.scope}.md").exists():
+            print(f"unknown scope {args.scope!r}; known scopes: {known}", file=sys.stderr)
+            return 2
+
+    if args.supersedes:
+        store.ensure_fresh(cfg)
+        conn = store.connect(cfg)
+        try:
+            known_ids = {r["id"] for r in conn.execute("SELECT id FROM memories")}
+        finally:
+            conn.close()
+        missing = [s for s in store.split_ids(args.supersedes) if s not in known_ids]
+        if missing:
+            print(f"--supersedes references unknown id(s): {', '.join(missing)}", file=sys.stderr)
+            return 2
+
+    created = store.now_iso()
+    mem = store.Memory(
+        id=store.new_id(title, created),
+        scope=args.scope,
+        title=title,
+        body=body,
+        type=args.type,
+        tags=_parse_tags(args.tags),
+        importance=max(1, min(5, args.importance)),
+        # A persona-scoped memory is authored by that persona; for `shared`
+        # there is nothing to infer, so leave it blank rather than write "shared".
+        author=args.author or ("" if args.scope == "shared" else args.scope),
+        created=created,
+        source_session=args.session or "",
+        supersedes=args.supersedes,
+    )
+
+    conn = store.connect(cfg)
+    try:
+        store.ensure_fresh(cfg)
+        near = retrieve.search(
+            cfg,
+            mem.embed_text(),
+            scopes=[mem.scope, "shared"] if mem.scope != "shared" else ["shared"],
+            k=3,
+            threshold=0.0,
+            conn=conn,
+        )
+        path = store.write_memory(cfg, mem)
+        store.reindex(cfg, conn=conn)
+    finally:
+        conn.close()
+
+    print(f"stored {mem.id}")
+    print(f"  file: {path.relative_to(cfg.root)}")
+    dupes = [h for h in near if h.cos > cfg.compaction["near_duplicate_threshold"]]
+    if dupes:
+        print("  near-duplicates (cos > %.2f) — consider `bin/memory supersede <old> %s`:"
+              % (cfg.compaction["near_duplicate_threshold"], mem.id))
+        for h in dupes:
+            print(f"    {h.cos:.3f}  [{h.id}] {h.title}")
+    return 0
+
+
+def cmd_search(args) -> int:
+    cfg = _cfg(args)
+    store.ensure_fresh(cfg)
+    scopes = args.scope or None
+    hits = retrieve.search(
+        cfg, args.query, scopes=scopes, k=args.k, threshold=args.threshold,
+        include_superseded=args.include_superseded,
+    )
+    if args.json:
+        print(json.dumps([h.__dict__ for h in hits], ensure_ascii=False, indent=2))
+        return 0
+    if not hits:
+        print("no memory above threshold")
+        return 0
+    for h in hits:
+        print(f"{h.score:.3f} (rel {h.relevance:.3f}, cos {h.cos:.3f}) [{h.id}] ({h.scope}/{h.type}) {h.title}")
+        if args.verbose:
+            print(f"        tags: {', '.join(h.tags) or 'none'}")
+            print(f"        {' '.join(h.body.split())}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    cfg = _cfg(args)
+    store.ensure_fresh(cfg)
+    conn = store.connect(cfg)
+    try:
+        sql = "SELECT m.*, COALESCE(u.recalled_count, 0) rc, u.last_recalled lr FROM memories m " \
+              "LEFT JOIN usage u ON u.id = m.id"
+        params: list = []
+        clauses = []
+        if args.scope:
+            clauses.append("m.scope IN (%s)" % ",".join("?" * len(args.scope)))
+            params.extend(args.scope)
+        if not args.include_superseded:
+            clauses.append("m.superseded_by IS NULL")
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY m.created DESC"
+        rows = list(conn.execute(sql, params))
+    finally:
+        conn.close()
+
+    if args.unused:
+        rows = [r for r in rows if r["rc"] == 0]
+    if args.older_than is not None:
+        rows = [r for r in rows if store.age_days(r["created"]) > args.older_than]
+
+    if args.json:
+        print(json.dumps(
+            [{"id": r["id"], "scope": r["scope"], "type": r["type"], "importance": r["importance"],
+              "created": r["created"], "tags": store.tags_of(r), "title": r["title"],
+              "recalled_count": r["rc"], "last_recalled": r["lr"]} for r in rows],
+            ensure_ascii=False, indent=2))
+        return 0
+    for r in rows:
+        flag = " (superseded)" if r["superseded_by"] else ""
+        print(f"{r['created'][:10]}  {r['scope']:<12} imp{r['importance']} recalled:{r['rc']:<3} "
+              f"[{r['id']}] {r['title']}{flag}")
+    print(f"-- {len(rows)} memories")
+    return 0
+
+
+def cmd_show(args) -> int:
+    cfg = _cfg(args)
+    conn = store.connect(cfg)
+    try:
+        row = conn.execute("SELECT * FROM memories WHERE id = ?", (args.id,)).fetchone()
+        if not row:
+            print(f"unknown id: {args.id}", file=sys.stderr)
+            return 2
+        usage = store.usage_of(conn, args.id)
+    finally:
+        conn.close()
+    path = cfg.root / row["path"]
+    print(path.read_text(encoding="utf-8").rstrip())
+    print(f"\n-- file: {row['path']}")
+    print(f"-- recalled {usage['recalled_count']}x, last {usage['last_recalled'] or 'never'}, "
+          f"sessions {usage['injected_sessions']}")
+    if row["superseded_by"]:
+        print(f"-- superseded by {row['superseded_by']}")
+    return 0
+
+
+def cmd_supersede(args) -> int:
+    cfg = _cfg(args)
+    conn = store.connect(cfg)
+    try:
+        rows = {
+            r["id"]: r
+            for r in conn.execute("SELECT * FROM memories WHERE id IN (?, ?)", (args.old, args.new))
+        }
+    finally:
+        conn.close()
+    for mid in (args.old, args.new):
+        if mid not in rows:
+            print(f"unknown id: {mid}", file=sys.stderr)
+            return 2
+
+    path = cfg.root / rows[args.new]["path"]
+    if _guard_scope(cfg, rows[args.new]["scope"], args) != 0:
+        return 2
+    mem = store.read_memory(path)
+    existing = store.split_ids(mem.supersedes)
+    if args.old not in existing:
+        existing.append(args.old)
+    mem.supersedes = ", ".join(existing)
+    path.write_text(mem.render(), encoding="utf-8")
+    store.reindex(cfg)
+    print(f"{args.new} now supersedes {mem.supersedes}; {args.old} is hidden from search")
+    return 0
+
+
+def cmd_archive(args) -> int:
+    cfg = _cfg(args)
+    conn = store.connect(cfg)
+    try:
+        scopes = {
+            r["id"]: r["scope"]
+            for r in conn.execute("SELECT id, scope FROM memories")
+        }
+        for mid in args.ids:
+            if _guard_scope(cfg, scopes.get(mid, "shared"), args) != 0:
+                return 2
+        for mid in args.ids:
+            dest = store.archive(cfg, mid, conn)
+            print(f"archived {mid} -> {dest.relative_to(cfg.root)}")
+        store.reindex(cfg, conn=conn)
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_compact(args) -> int:
+    cfg = _cfg(args)
+    if args.apply:
+        raw = sys.stdin.read() if args.apply == "-" else Path(args.apply).read_text(encoding="utf-8")
+        plan = json.loads(raw)
+        result = compaction.apply(cfg, plan, force=getattr(args, "force", False))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    store.ensure_fresh(cfg)
+    rep = compaction.report(cfg, scopes=args.scope or None)
+    if args.quiet:
+        threshold = cfg.compaction["nudge_threshold"]
+        if rep["candidates"] >= threshold:
+            print(f"memory: {rep['candidates']} compaction candidates, "
+                  f"run /compact-memory when convenient")
+        return 0
+    print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_tags(args) -> int:
+    cfg = _cfg(args)
+    store.ensure_fresh(cfg)
+    vocab = load_vocabulary(cfg)
+    conn = store.connect(cfg)
+    try:
+        counts: dict[str, int] = {}
+        for row in conn.execute("SELECT tags_json FROM memories"):
+            for tag in (row["tags_json"] or "").split("\n"):
+                if tag:
+                    counts[tag] = counts.get(tag, 0) + 1
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps({"vocabulary": vocab, "usage": counts}, ensure_ascii=False, indent=2))
+        return 0
+
+    print("# controlled vocabulary (memory/tags.yaml)")
+    for namespace, leaves in vocab.items():
+        for leaf in leaves:
+            tag = f"{namespace}/{leaf}"
+            print(f"  {tag:<40} {counts.pop(tag, 0)}")
+    if counts:
+        print("\n# free tags in use")
+        for tag, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {tag:<40} {n}")
+    return 0
+
+
+# ---------------------------------------------------------------- argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="memory", description=__doc__.splitlines()[0])
+    p.add_argument("--root", default=os.environ.get("PERSONA_REPO_ROOT"), help=argparse.SUPPRESS)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("install", help="ollama pull the configured model, then doctor").set_defaults(fn=cmd_install)
+    sub.add_parser("doctor", help="check interpreter, daemon, model, dims, index").set_defaults(fn=cmd_doctor)
+
+    r = sub.add_parser("reindex", help="rebuild the index from the markdown files")
+    r.add_argument("--force", action="store_true", help="re-embed everything")
+    r.set_defaults(fn=cmd_reindex)
+
+    a = sub.add_parser("add", help="store a new memory")
+    a.add_argument("--scope", required=True)
+    a.add_argument("--type", required=True, choices=store.TYPES)
+    a.add_argument("--tags", action="append", default=[])
+    a.add_argument("--importance", type=int, default=3)
+    a.add_argument("--title", required=True)
+    a.add_argument("--body")
+    a.add_argument("--body-file", help="'-' reads the body from stdin")
+    a.add_argument("--author", default="")
+    a.add_argument("--session", default="")
+    a.add_argument("--supersedes", default=None)
+    a.add_argument("--force", action="store_true", help="write another persona's scope anyway")
+    a.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("search", help="semantic search over the index")
+    s.add_argument("query")
+    s.add_argument("--scope", action="append")
+    s.add_argument("-k", type=int, default=10)
+    s.add_argument("--threshold", type=float, default=None)
+    s.add_argument("--include-superseded", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    l = sub.add_parser("list", help="list memories")
+    l.add_argument("--scope", action="append")
+    l.add_argument("--unused", action="store_true", help="never recalled")
+    l.add_argument("--older-than", type=float, metavar="DAYS")
+    l.add_argument("--include-superseded", action="store_true")
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(fn=cmd_list)
+
+    sh = sub.add_parser("show", help="print one memory file plus its usage stats")
+    sh.add_argument("id")
+    sh.set_defaults(fn=cmd_show)
+
+    sp = sub.add_parser("supersede", help="mark OLD as replaced by NEW")
+    sp.add_argument("old")
+    sp.add_argument("new")
+    sp.add_argument("--force", action="store_true", help="write another persona's scope anyway")
+    sp.set_defaults(fn=cmd_supersede)
+
+    ar = sub.add_parser("archive", help="move memories to memory/_archive (never deleted)")
+    ar.add_argument("ids", nargs="+")
+    ar.add_argument("--force", action="store_true", help="archive another persona's scope anyway")
+    ar.set_defaults(fn=cmd_archive)
+
+    cp = sub.add_parser("compact", help="report compaction candidates or apply a reviewed plan")
+    cp.add_argument("--report", action="store_true", help="default; kept for readability")
+    cp.add_argument("--scope", action="append")
+    cp.add_argument("--apply", metavar="PLAN.json", help="'-' reads the plan from stdin")
+    cp.add_argument("--quiet", action="store_true", help="one nudge line, or nothing")
+    cp.add_argument("--force", action="store_true", help="write another persona's scope anyway")
+    cp.set_defaults(fn=cmd_compact)
+
+    t = sub.add_parser("tags", help="controlled vocabulary plus usage counts")
+    t.add_argument("--json", action="store_true")
+    t.set_defaults(fn=cmd_tags)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except (configlib.ConfigError, store.StoreError, embedder.EmbeddingError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

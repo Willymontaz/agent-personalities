@@ -1,0 +1,43 @@
+# Controlled tag vocabulary.
+#
+# Tags are language-neutral English kebab-case slugs, so a French memory and an
+# English memory about the same thing share a tag. A tag is written
+# "<namespace>/<leaf>", e.g. topics/code-review.
+#
+# This list is a starting point, not a fence: free tags outside it are allowed
+# and show up under "free tags in use" in `bin/memory tags`. Promote a free tag
+# here once it has earned its place.
+
+topics:
+  - code-review
+  - architecture
+  - testing
+  - debugging
+  - performance
+  - security
+  - tooling
+  - writing
+  - planning
+  - workflow
+  - deployment
+  - release
+  - communication-style
+  - humour
+  - music
+  - food
+  - travel
+  - health
+  - learning
+
+people:
+  - alex
+
+projects:
+  - agent-personalities
+
+prefs:
+  - language
+  - tone
+  - verbosity
+  - formatting
+  - schedule

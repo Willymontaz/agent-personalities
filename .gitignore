@@ -1,0 +1,29 @@
+# Private memory content — user-session data, never synced to git.
+# Covers memory/shared/, every memory/<persona>/, and memory/_archive/.
+# Only memory/config.json and memory/tags.yaml (setup scaffolding) are tracked;
+# back your memories up with your own mechanism (see README §4).
+memory/*/
+
+# Private personas — your agent files and voice pools are personal, not shipped.
+# Only the `example` template stays tracked, as first-setup scaffolding.
+.claude/agents/*.md
+!.claude/agents/example.md
+personas/*/
+!personas/example/
+
+# Derived index — rebuilt from the markdown files with `bin/memory reindex`.
+memory/.index.sqlite
+memory/.index.sqlite-journal
+memory/.index.sqlite-wal
+memory/.index.sqlite-shm
+
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Personal / local Claude Code config (per-machine, not shared)
+.claude/settings.local.json
+.claude/.headroom_*
+
+# macOS
+.DS_Store

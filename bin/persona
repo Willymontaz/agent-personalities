@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# bin/persona <name> [extra claude args...]
+#
+# Open a Claude Code session *as* a persona: make sure the embedding backend is
+# actually up, make sure the index matches the files on disk, then hand over to
+# `claude --agent <name>`.
+#
+# It fails rather than starting a session with no recall — a persona that has
+# silently forgotten everything is worse than one that refuses to start.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OLLAMA_URL="http://127.0.0.1:11434"
+
+die() { printf 'persona: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<EOF
+usage: bin/persona <name> [claude args...]
+
+personas available:
+EOF
+  for f in "$ROOT"/.claude/agents/*.md; do
+    [ -e "$f" ] || { echo "  (none — create .claude/agents/<name>.md)" >&2; return; }
+    printf '  %s\n' "$(basename "$f" .md)" >&2
+  done
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+case "$1" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+NAME="$1"; shift
+AGENT_FILE="$ROOT/.claude/agents/$NAME.md"
+[ -f "$AGENT_FILE" ] || { printf 'persona: no such persona: %s\n' "$NAME" >&2; usage; exit 2; }
+
+# --- 1. embedding backend up ------------------------------------------------
+if ! curl -fsS -m 2 "$OLLAMA_URL/api/version" >/dev/null 2>&1; then
+  command -v ollama >/dev/null 2>&1 || die "ollama is not installed (brew install ollama)"
+  printf 'persona: starting ollama ...\n' >&2
+  nohup ollama serve >"${TMPDIR:-/tmp}/persona-ollama.log" 2>&1 &
+  for _ in $(seq 1 20); do
+    curl -fsS -m 2 "$OLLAMA_URL/api/version" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  curl -fsS -m 2 "$OLLAMA_URL/api/version" >/dev/null 2>&1 \
+    || die "ollama did not answer within 10s — see ${TMPDIR:-/tmp}/persona-ollama.log"
+fi
+
+# --- 2. this persona has a memory scope ------------------------------------
+mkdir -p "$ROOT/memory/$NAME" "$ROOT/memory/shared"
+
+# --- 3. index matches the files --------------------------------------------
+"$ROOT/bin/memory" reindex >/dev/null || die "reindex failed — run \`bin/memory doctor\`"
+"$ROOT/bin/memory" doctor >/dev/null || { "$ROOT/bin/memory" doctor; exit 1; }
+
+# --- 4. hand over -----------------------------------------------------------
+cd "$ROOT"   # so .claude/agents, hooks and CLAUDE.md all resolve
+# The scope guard in bin/memory reads this: a persona session may write only
+# `shared` or its own scope unless --force is passed. The hooks also fall back
+# to it if the agent_type field is ever missing.
+export PERSONA_NAME="$NAME"
+exec headroom wrap claude --agent "$NAME" "$@"
